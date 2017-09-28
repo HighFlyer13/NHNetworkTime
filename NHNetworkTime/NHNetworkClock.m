@@ -50,6 +50,7 @@
 
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
+    pthread_mutex_destroy(&_timeAssociationsMutex);
 }
 
 - (void)reset {
