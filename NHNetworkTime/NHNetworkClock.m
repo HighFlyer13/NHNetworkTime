@@ -1,4 +1,4 @@
-#import <arpa/inet.h>
+#import <pthread.h>
 
 #import "NHNetworkClock.h"
 #import "NHNTLog.h"
@@ -7,7 +7,8 @@
 
 @interface NHNetworkClock () <NHNetAssociationDelegate>
 
-@property NSMutableArray *timeAssociations;
+@property NSMutableArray<NHNetAssociation *> *timeAssociations;
+@property (nonatomic, assign) pthread_mutex_t timeAssociationsMutex;
 @property NSArray *sortDescriptors;
 @property NSSortDescriptor *dispersionSortDescriptor;
 @property dispatch_queue_t associationDelegateQueue;
@@ -34,6 +35,8 @@
         self.timeAssociations = [NSMutableArray arrayWithCapacity:100];
         self.shouldUseSavedSynchronizedTime = YES;
         self.isAutoSynchronizedWhenUserChangeLocalTime = YES;
+
+        pthread_mutex_init(&_timeAssociationsMutex, NULL);
         
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationSignificantTimeChangeNotification object:nil queue:nil usingBlock:^(NSNotification * _Nonnull note) {
             if(self.isAutoSynchronizedWhenUserChangeLocalTime) {
@@ -51,8 +54,10 @@
 
 - (void)reset {
     self.isSynchronized = NO;
-    [self finishAssociations];
-    [self.timeAssociations removeAllObjects];
+    pthread_mutex_lock(&_timeAssociationsMutex);
+        [self finishAssociations];
+        [self.timeAssociations removeAllObjects];
+    pthread_mutex_unlock(&_timeAssociationsMutex);
 }
 
 // Return the offset to network-derived UTC.
@@ -61,31 +66,29 @@
     
     double timeInterval = 0.0;
     short usefulCount = 0;
-    
-    if(self.timeAssociations.count > 0) {
-    
-        NSArray *sortedArray = [[self.timeAssociations sortedArrayUsingDescriptors:self.sortDescriptors] filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(id  _Nonnull evaluatedObject, NSDictionary<NSString *,id> * _Nullable bindings) {
-            return [evaluatedObject isKindOfClass:[NHNetAssociation class]];
-        }]];
-        
-        for (NHNetAssociation * timeAssociation in sortedArray) {
-            if (timeAssociation.active) {
-                if (timeAssociation.trusty) {
-                    usefulCount++;
-                    timeInterval = timeInterval + timeAssociation.offset;
-                }
-                else {
-                    if ([self.timeAssociations count] > 8) {
-                        [self.timeAssociations removeObject:timeAssociation];
-                        [timeAssociation finish];
+
+    pthread_mutex_lock(&_timeAssociationsMutex);
+        if (self.timeAssociations.count > 0) {
+            NSArray *sortedArray = [self.timeAssociations sortedArrayUsingDescriptors:self.sortDescriptors];
+
+            for (NHNetAssociation *timeAssociation in sortedArray) {
+                if (timeAssociation.active) {
+                    if (timeAssociation.trusty) {
+                        usefulCount++;
+                        timeInterval = timeInterval + timeAssociation.offset;
+                    } else {
+                        if (self.timeAssociations.count > 8) {
+                            [self.timeAssociations removeObject:timeAssociation];
+                            [timeAssociation finish];
+                        }
                     }
+
+                    if (usefulCount == 8) break;                // use 8 best dispersions
                 }
-                
-                if (usefulCount == 8) break;                // use 8 best dispersions
             }
         }
-    }
-    
+    pthread_mutex_unlock(&_timeAssociationsMutex);
+
     if (usefulCount > 0) {
         timeInterval = timeInterval / usefulCount;
     }
@@ -179,13 +182,18 @@
     NTP_Logging(@"%@", hostAddresses);                          // all the addresses resolved
 
     // ... now start one 'association' (network clock server) for each address.
+    NSMutableArray<NHNetAssociation *> *associations = [NSMutableArray arrayWithCapacity:hostAddresses.count];
     for (NSString *server in hostAddresses) {
-        NHNetAssociation *    timeAssociation = [[NHNetAssociation alloc] initWithServerName:server];
+        NHNetAssociation *timeAssociation = [[NHNetAssociation alloc] initWithServerName:server];
         timeAssociation.delegate = self;
 
-        [self.timeAssociations addObject:timeAssociation];
+        [associations addObject:timeAssociation];
         [timeAssociation enable];                               // starts are randomized internally
     }
+
+    pthread_mutex_lock(&_timeAssociationsMutex);
+        [self.timeAssociations addObjectsFromArray:associations];
+    pthread_mutex_unlock(&_timeAssociationsMutex);
 }
 
 // Stop all the individual ntp clients associations ..
